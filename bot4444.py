@@ -32,7 +32,7 @@ import os
 
 # ===================== CONFIG =====================
 
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 
 ALLOWED_ASSIGNEES = set(
