@@ -1,0 +1,1237 @@
+import asyncio
+import logging
+import os
+from datetime import datetime, timedelta
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
+from aiogram.types import Message, CallbackQuery
+from aiogram import types
+from asyncpg import Record
+from aiogram import Router
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import Command
+from aiogram.types import TelegramObject
+from aiogram.dispatcher.flags import get_flag
+from aiogram import Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
+import calendar
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
+
+import asyncpg
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+# ===================== CONFIG =====================
+
+
+
+
+class AddTaskFSM(StatesGroup):
+    waiting_text = State()
+    waiting_date = State()
+    waiting_time = State()
+
+class EditTaskFSM(StatesGroup):
+    waiting_text = State()
+    waiting_date = State()
+    waiting_time = State()
+
+class EditDateFSM(StatesGroup):
+    waiting_date = State()
+    waiting_time = State()
+
+
+# ===================== LOGGING =====================
+
+logging.basicConfig(level=logging.INFO)
+
+# ===================== BOT INIT =====================
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+scheduler = AsyncIOScheduler()
+
+# ===================== DATABASE =====================
+
+db: asyncpg.Pool = None
+
+
+async def init_db():
+    global db
+    db = await asyncpg.create_pool(dsn=POSTGRES_DSN)
+
+class AuthState(StatesGroup):
+    waiting_password = State()
+
+# ===================== UTILS =====================
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить задачу", callback_data="add_task")],
+        [InlineKeyboardButton(text="📅 Задачи на сегодня", callback_data="today_tasks")],
+        [InlineKeyboardButton(text="📆 Задачи на завтра", callback_data="tomorrow_tasks")],
+        [InlineKeyboardButton(text="🗂 Все задачи", callback_data="all_tasks")],
+        [InlineKeyboardButton(text="🧑‍💼 Мои задачи", callback_data="my_tasks")],
+        [InlineKeyboardButton(text="📌 Назначенные мне", callback_data="assigned_to_me")]
+    ])
+
+
+# ===================== COMMANDS =====================
+
+@router.message(Command("start", "menu"))
+async def start_cmd(message: Message, state: FSMContext):
+    user = await db.fetchrow(
+        "SELECT authorized FROM bot_users WHERE user_id=$1",
+        message.from_user.id
+    )
+
+    if not user or not user["authorized"]:
+        await message.answer("🔐 Введите пароль доступа:")
+        await state.set_state(AuthState.waiting_password)
+        return
+
+    await message.answer(
+        "👋 <b>Добро пожаловать в менеджер задач</b>\n\nВыбери действие:",
+        reply_markup=main_menu()
+    )
+
+@router.message(AuthState.waiting_password)
+async def check_password(message: Message, state: FSMContext):
+    if message.text != BOT_PASSWORD:
+        await message.answer("❌ Неверный пароль. Попробуй ещё раз:")
+        return
+
+    await db.execute(
+        """
+        INSERT INTO bot_users (user_id, authorized)
+        VALUES ($1, TRUE)
+        ON CONFLICT (user_id)
+        DO UPDATE SET authorized=TRUE
+        """,
+        message.from_user.id
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Доступ разрешён!\n\n👋 <b>Добро пожаловать в менеджер задач</b>\n\nВыбери действие:",
+        reply_markup=main_menu()
+    )
+
+async def is_authorized(user_id: int) -> bool:
+    row = await db.fetchrow(
+        "SELECT authorized FROM bot_users WHERE user_id=$1",
+        user_id
+    )
+    return bool(row and row["authorized"])
+
+@router.message(Command("arh"))
+async def archive_cmd(message: Message):
+    rows = await db.fetch(
+        """
+        SELECT text, task_datetime
+        FROM tasks
+        WHERE assigned_user_id = $1 AND completed = TRUE
+        ORDER BY task_datetime DESC
+        """,
+        message.from_user.id
+    )
+
+    if not rows:
+        await message.answer("Архив пуст.")
+        return
+
+    for row in rows:
+        await message.answer(
+            f"✅ <b>{row['text']}</b>\n"
+            f"📅 {row['task_datetime'].strftime('%d.%m.%Y %H:%M')}"
+        )
+
+def calendar_kb(year: int, month: int):
+    kb = []
+
+    kb.append([
+        InlineKeyboardButton(text="◀️", callback_data=f"cal_prev_{year}_{month}"),
+        InlineKeyboardButton(text=f"{calendar.month_name[month]} {year}", callback_data="ignore"),
+        InlineKeyboardButton(text="▶️", callback_data=f"cal_next_{year}_{month}")
+    ])
+
+    week_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    kb.append([InlineKeyboardButton(text=d, callback_data="ignore") for d in week_days])
+
+    for week in calendar.monthcalendar(year, month):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+            else:
+                row.append(
+                    InlineKeyboardButton(
+                        text=str(day),
+                        callback_data=f"cal_day_{year}_{month}_{day}"
+                    )
+                )
+        kb.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+@router.callback_query(lambda c: c.data.startswith("cal_"))
+async def calendar_handler(callback: CallbackQuery, state: FSMContext):
+    data = callback.data.split("_")
+
+    # -------------------------------
+    # 1. Выбор конкретного дня
+    # -------------------------------
+    if data[1] == "day":
+        # безопасная распаковка
+        if len(data) < 5:
+            await callback.answer("Ошибка календаря!")
+            return
+
+        prefix, action, year, month, day = data
+        year, month, day = int(year), int(month), int(day)
+
+        # Сохраняем выбранную дату в state
+        await state.update_data(date=f"{year}-{month}-{day}")
+
+        # Проверяем текущее состояние FSM
+        current_state = await state.get_state()
+        if current_state == EditDateFSM.waiting_date.state:
+            await state.set_state(EditDateFSM.waiting_time)
+            await callback.message.answer("⏰ Введи новое время (ЧЧ:ММ)")
+        elif current_state == AddTaskFSM.waiting_date.state:
+            await state.set_state(AddTaskFSM.waiting_time)
+            await callback.message.answer("⏰ Введи время (ЧЧ:ММ)")
+        else:
+            await callback.answer("Неверное состояние FSM!")
+
+    # -------------------------------
+    # 2. Переход на предыдущий месяц
+    # -------------------------------
+    elif data[1] == "prev":
+        if len(data) < 4:
+            await callback.answer("Ошибка календаря!")
+            return
+
+        prefix, action, year, month = data
+        year, month = int(year), int(month) - 1
+        if month == 0:
+            month = 12
+            year -= 1
+        await callback.message.edit_reply_markup(reply_markup=calendar_kb(year, month))
+
+    # -------------------------------
+    # 3. Переход на следующий месяц
+    # -------------------------------
+    elif data[1] == "next":
+        if len(data) < 4:
+            await callback.answer("Ошибка календаря!")
+            return
+
+        prefix, action, year, month = data
+        year, month = int(year), int(month) + 1
+        if month == 13:
+            month = 1
+            year += 1
+        await callback.message.edit_reply_markup(reply_markup=calendar_kb(year, month))
+
+    # -------------------------------
+    # 4. Подтверждение выбора
+    # -------------------------------
+    await callback.answer()
+
+
+async def calendar_handler(callback: CallbackQuery, state: FSMContext):
+    
+    await callback.answer()
+
+@router.message(AddTaskFSM.waiting_time)
+async def get_time(message: Message, state: FSMContext):
+    try:
+        hour, minute = map(int, message.text.split(":"))
+    except ValueError:
+        await message.answer("❌ Неверный формат. Используй ЧЧ:ММ")
+        return
+
+    data = await state.get_data()
+    dt = datetime.strptime(
+        f"{data['date']} {hour}:{minute}",
+        "%Y-%m-%d %H:%M"
+    )
+
+    row = await db.fetchrow(
+        """
+        INSERT INTO tasks (user_id, text, task_datetime, created_at)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+        """,
+        message.from_user.id,
+        data["text"],
+        dt,                 # TIMESTAMP ✅
+        datetime.now()      # TIMESTAMP ✅
+    )
+
+    scheduler.add_job(
+        bot.send_message,
+        "date",
+        run_date=dt,
+        args=[GROUP_ID, f"🆕 <b>Задача:</b>\n\n{data['text']}"]
+    )
+
+    await message.answer(
+        f"✅ <b>Задача создана на {dt.strftime('%d.%m.%Y %H:%M')}</b>"
+    )
+
+    await state.clear()
+
+
+# ===================== GROUP: CREATE TASK =====================
+@router.message(Command("задача"))
+async def create_task_group(message: Message):
+    if message.chat.id != GROUP_ID:
+        return
+
+    task_text = message.text.replace("/задача", "").strip()
+    if not task_text:
+        await message.reply("Напиши текст задачи.")
+        return
+
+    # 1️⃣ создаём задачу в БД
+    row = await db.fetchrow(
+        """
+        INSERT INTO tasks (user_id, text, task_datetime, created_at)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id
+        """,
+        message.from_user.id,
+        task_text,
+        None,
+        datetime.now()
+    )
+
+    task_id = row["id"]
+
+    # 2️⃣ отправляем сообщение о задаче В ЭТУ ЖЕ ГРУППУ
+    msg = await message.answer(
+        f"📌 <b>Задача</b>\n{task_text}"
+    )
+
+    # 3️⃣ сохраняем message_id сообщения задачи
+    await db.execute(
+        "UPDATE tasks SET group_msg_id=$1 WHERE id=$2",
+        msg.message_id,
+        task_id
+    )
+@router.message(F.text == "+", F.reply_to_message)
+async def complete_task_plus(message: Message):
+    task = await db.fetchrow(
+        "SELECT * FROM tasks WHERE group_msg_id=$1 AND completed=FALSE",
+        message.reply_to_message.message_id
+    )
+
+    if not task:
+        return
+
+    await db.execute(
+        "UPDATE tasks SET completed=TRUE WHERE id=$1",
+        task["id"]
+    )
+
+    await message.reply("✅ Задача выполнена")
+@router.message(F.text.lower() == "принято", F.reply_to_message)
+async def accept_task(message: Message):
+    task = await db.fetchrow(
+        "SELECT * FROM tasks WHERE group_msg_id=$1",
+        message.reply_to_message.message_id
+    )
+
+    if not task:
+        return
+
+    await db.execute(
+        "UPDATE tasks SET assigned_user_id=$1 WHERE id=$2",
+        message.from_user.id,
+        task["id"]
+    )
+
+    await message.reply("👤 Ты назначен исполнителем")
+
+
+@router.callback_query(F.data == "add_task")
+async def add_task(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AddTaskFSM.waiting_text)
+    await callback.message.answer("✍️ Напиши текст задачи:")
+    await callback.answer()
+
+@router.message(AddTaskFSM.waiting_text)
+async def get_text(message: Message, state: FSMContext):
+    await state.update_data(text=message.text)
+
+    now = datetime.now()
+    await state.set_state(AddTaskFSM.waiting_date)
+    await message.answer(
+        "📅 Выбери дату:",
+        reply_markup=calendar_kb(now.year, now.month)
+    )
+
+from aiogram.types import Message, CallbackQuery
+from aiogram import F
+from datetime import datetime
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+
+@router.message(F.text == "/my_tasks")  # Пример вызова списка задач в ЛС
+async def show_my_tasks(message: Message):
+    user_id = message.from_user.id
+    tasks = await db.fetch("SELECT id, text, task_datetime FROM tasks WHERE user_id=$1 AND completed=FALSE ORDER BY task_datetime", user_id)
+
+    for t in tasks:
+        dt = t['task_datetime'].strftime("%d.%m.%Y %H:%M")
+        markup = InlineKeyboardMarkup().add(
+            InlineKeyboardButton(text="✅ Выполнить", callback_data=f"complete_{t['id']}")
+        )
+        await message.answer(f"📝 {t['text']} — {dt}", reply_markup=markup)
+
+# Обработчик кнопки "Выполнить"
+@router.callback_query(F.data.startswith("complete_"))
+async def complete_task_lm(callback: CallbackQuery):
+    task_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+
+    await db.execute("UPDATE tasks SET completed=TRUE, completed_by=$1, completed_at=$2 WHERE id=$3",
+                     user_id, datetime.now(), task_id)
+
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Выполнено")
+    await callback.answer("Задача выполнена.")
+    
+# ===================== GROUP: ASSIGN EXECUTOR =====================
+
+@router.message(F.reply_to_message)
+async def assign_executor(message: Message):
+    if message.chat.id != GROUP_ID:
+        return
+
+    if not message.text or "@" not in message.text:
+        return
+
+    tag = message.text.strip()
+    if tag not in ALLOWED_ASSIGNEES:
+        await message.reply("❌ Этот пользователь недоступен.")
+        return
+
+    task = await db.fetchrow(
+        "SELECT * FROM tasks WHERE group_msg_id=$1 AND assigned_user_id IS NULL",
+        message.reply_to_message.message_id
+    )
+
+    if not task:
+        return
+
+    assigned_id = ALLOWED_ASSIGNEES[tag]
+
+    await db.execute(
+        "UPDATE tasks SET assigned_user_id=$1 WHERE id=$2",
+        assigned_id,
+        task["id"]
+    )
+
+    await message.answer("✅ <b>Исполнитель назначен</b>")
+
+    await bot.send_message(
+        assigned_id,
+        f"📌 <b>Тебе назначена задача:</b>\n\n{task['text']}"
+    )
+
+    schedule_reminder(task["id"])
+
+async def send_tasks(callback: CallbackQuery, start: datetime, end: datetime):
+    rows = await db.fetch(
+        """
+        SELECT * FROM tasks
+        WHERE user_id=$1 AND task_datetime BETWEEN $2 AND $3
+        ORDER BY task_datetime
+        """,
+        callback.from_user.id,
+        start,
+        end
+    )
+
+    if not rows:
+        await callback.message.answer("Нет задач.")
+        return
+
+    for task in rows:
+        dt = task["task_datetime"]
+        date_text = dt.strftime("%d.%m.%Y %H:%M") if dt else "Без даты"
+
+    await callback.message.answer(
+        f"📌 <b>{task['text']}</b>\n"
+        f"⏰ {date_text}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✏️ Редактировать",
+                        callback_data=f"edit_{task['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑 Удалить",
+                        callback_data=f"del_{task['id']}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔁 Изменить исполнителя",
+                        callback_data=f"change_exec_{task['id']}"
+                    )
+                ]
+            ]
+        )
+    )
+
+    await callback.answer()
+
+
+
+@router.callback_query(F.data == "today_tasks")
+async def today_tasks(callback: CallbackQuery):
+    now = datetime.now()
+    await send_tasks(callback, now.replace(hour=0, minute=0), now.replace(hour=23, minute=59))
+    await callback.answer()
+
+@router.callback_query(F.data == "tomorrow_tasks")
+async def tomorrow_tasks(callback: CallbackQuery):
+    tomorrow = datetime.now() + timedelta(days=1)
+    await send_tasks(
+        callback,
+        tomorrow.replace(hour=0, minute=0),
+        tomorrow.replace(hour=23, minute=59)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "all_tasks")
+async def all_tasks(callback: CallbackQuery):
+    rows = await db.fetch("SELECT * FROM tasks WHERE completed=FALSE ORDER BY task_datetime")
+    
+    if not rows:
+        await callback.message.answer("Нет активных задач.")
+        return
+
+    for task in rows:
+        # исполнитель
+        executor = "Не назначен"
+        if task["assigned_user_id"]:
+            executor = next(
+                (tag for tag, uid in ALLOWED_ASSIGNEES.items() if uid == task["assigned_user_id"]),
+                f"ID {task['assigned_user_id']}"
+            )
+
+        await callback.message.answer(
+            f"🧑‍💼 <b>{task['text']}</b>\n"
+            f"⏰ {task['task_datetime'].strftime('%d.%m.%Y %H:%M') if task['task_datetime'] else 'Без даты'}\n"
+            f"👤 <b>Исполнитель:</b> {executor}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{task['id']}"),
+                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{task['id']}")
+                ],
+                [
+                    InlineKeyboardButton(text="🔁 Изменить исполнителя", callback_data=f"change_exec_{task['id']}")
+                ]
+            ])
+        )
+        
+
+
+# ===================== COMPLETE TASK =====================
+
+async def complete_task(task_id: int):
+    await db.execute(
+        "UPDATE tasks SET completed=TRUE WHERE id=$1",
+        task_id
+    )
+
+    try:
+        scheduler.remove_job(f"task_{task_id}")
+    except:
+        pass
+
+
+@router.callback_query(F.data.startswith("done_"))
+async def done_callback(callback: CallbackQuery):
+    task_id = int(callback.data.split("_")[1])
+
+    await complete_task(task_id)
+
+    await callback.message.answer("✅ Задача выполнена")
+    await callback.answer()
+
+
+@router.message(F.reply_to_message)
+async def complete_by_reply(message: Message):
+    if message.chat.id != GROUP_ID:
+        return
+
+    task = await db.fetchrow(
+        "SELECT * FROM tasks WHERE group_msg_id=$1 AND assigned_user_id=$2 AND completed=FALSE",
+        message.reply_to_message.message_id,
+        message.from_user.id
+    )
+
+    if not task:
+        return
+
+    await complete_task(task["id"])
+    await message.answer("✅ <b>Задача выполнена</b>")
+
+# ===================== ASSIGNED TO ME =====================
+
+@router.callback_query(F.data == "assigned_to_me")
+async def assigned_to_me(callback: CallbackQuery):
+    rows = await db.fetch(
+        """
+        SELECT * FROM tasks
+        WHERE assigned_user_id=$1 AND completed=FALSE
+        ORDER BY task_datetime NULLS LAST
+        """,
+        callback.from_user.id
+    )
+
+    if not rows:
+        await callback.message.answer("📭 Нет назначенных задач.")
+        return
+
+    for task in rows:
+        await callback.message.answer(
+            f"📌 <b>{task['text']}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"done_{task['id']}")]
+            ])
+        )
+
+    await callback.answer()
+
+# ===================== REMINDERS =====================
+
+async def remind_task(task_id: int):
+    task = await db.fetchrow(
+        """
+        SELECT id, text, task_datetime, target_chat_id, completed
+        FROM tasks
+        WHERE id = $1
+        """,
+        task_id
+    )
+
+    if not task or task["completed"]:
+        return
+
+    text = (
+        "📌 Задача:\n"
+        f"{task['text']}\n\n"
+        f"⏰ {task['task_datetime'].strftime('%d.%m.%Y %H:%M')}\n\n"
+    )
+
+    await bot.send_message(
+        task["target_chat_id"],
+        text
+    )
+
+    
+
+def schedule_reminder(task_id: int):
+    scheduler.add_job(
+        remind_task,
+        "interval",
+        hours=1,
+        args=[task_id],
+        id=f"task_{task_id}",
+        replace_existing=True
+    )
+
+
+@router.callback_query(F.data == "my_tasks")
+async def my_tasks(callback: CallbackQuery):
+    rows = await db.fetch(
+        """
+        SELECT * FROM tasks
+        WHERE user_id=$1 AND completed=FALSE
+        ORDER BY task_datetime NULLS LAST
+        """,
+        callback.from_user.id
+    )
+
+    if not rows:
+        await callback.message.answer("У тебя нет активных задач.")
+        return
+
+    for task in rows:
+        if task["assigned_user_id"]:
+            executor = next(
+                (tag for tag, uid in ALLOWED_ASSIGNEES.items() if uid == task["assigned_user_id"]),
+                f"ID {task['assigned_user_id']}"
+            )
+        else:
+            executor = "Не назначен"
+
+        await callback.message.answer(
+            f"🧑‍💼 <b>{task['text']}</b>\n"
+            f"⏰ {task['task_datetime'].strftime('%d.%m.%Y %H:%M') if task['task_datetime'] else 'Без даты'}\n"
+            f"👤 <b>Исполнитель:</b> {executor}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{task['id']}"),
+                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del_{task['id']}")
+                ],
+                [
+                    InlineKeyboardButton(text="🔁 Изменить исполнителя", callback_data=f"change_exec_{task['id']}")
+                ]
+            ])
+        )
+    await callback.answer()
+
+    
+
+@router.message(EditDateFSM.waiting_time)
+async def save_new_datetime(message: Message, state: FSMContext, db, bot: Bot):
+    # Проверка формата времени
+    try:
+        hour, minute = map(int, message.text.split(":"))
+    except ValueError:
+        await message.answer("❌ Формат времени: ЧЧ:ММ")
+        return
+
+    data = await state.get_data()
+    task_id = data["task_id"]
+
+    # Собираем datetime
+    new_dt = datetime.strptime(f"{data['date']} {hour}:{minute}", "%Y-%m-%d %H:%M")
+
+    # Обновляем базу
+    await db.execute(
+        "UPDATE tasks SET task_datetime=$1 WHERE id=$2",
+        new_dt,
+        task_id
+    )
+
+    # Перепланируем отложенную отправку в группу
+    scheduler.add_job(
+        bot.send_message,
+        "date",
+        run_date=new_dt,
+        args=[GROUP_ID, f"⏰ <b>Обновлённая задача</b>"],
+        id=f"delayed_{task_id}",
+        replace_existing=True
+    )
+
+
+    task = await db.fetchrow(
+    "SELECT text, task_datetime FROM tasks WHERE id=$1",
+    task_id
+)
+    text = (
+    "📌 Задача:\n"
+    f"{task['text']}\n\n"
+    f"⏰ {task['task_datetime'].strftime('%d.%m.%Y %H:%M')}"
+)
+    await bot.send_message(
+    GROUP_ID,
+    text
+)
+
+
+    await message.answer(f"✅ <b>Дата и время обновлены:</b>\n{new_dt.strftime('%d.%m.%Y %H:%M')}")
+    await state.clear()
+
+
+
+@router.callback_query(F.data.startswith("change_exec_"))
+async def change_executor(callback: CallbackQuery):
+    task_id = int(callback.data.split("_")[-1])
+
+    kb = [
+        [InlineKeyboardButton(text=tag, callback_data=f"set_exec_{task_id}_{uid}")]
+        for tag, uid in ALLOWED_ASSIGNEES.items()
+    ]
+
+    await callback.message.answer(
+        "Выбери нового исполнителя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("set_exec_"))
+async def set_executor(callback: CallbackQuery):
+    _, _, task_id, uid = callback.data.split("_")
+    task_id = int(task_id)
+    uid = int(uid)
+
+    await db.execute(
+        "UPDATE tasks SET assigned_user_id=$1 WHERE id=$2",
+        uid,
+        task_id
+    )
+
+    await bot.send_message(uid, "📌 Тебе назначили новую задачу.")
+    await callback.message.answer("✅ Исполнитель изменён")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("edit_"))
+async def edit_task(callback: CallbackQuery, state: FSMContext):
+    # callback.data раньше был вида "edit_123"
+    parts = callback.data.split("_")
+
+    # Проверка: если у нас старый формат "edit_123"
+    if len(parts) == 2:
+        try:
+            task_id = int(parts[1])
+        except ValueError:
+            await callback.answer("Ошибка! Некорректный ID задачи.", show_alert=True)
+            return
+        await state.update_data(task_id=task_id)
+
+        await callback.message.answer(
+            "Что ты хочешь отредактировать?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Текст задачи", callback_data=f"edit_text_{task_id}")],
+                [InlineKeyboardButton(text="📅 Дату и время", callback_data=f"edit_datetime_{task_id}")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    # Новый формат для кнопок внутри меню "Редактировать задачу"
+    if len(parts) == 3:
+        action = parts[1]      # text или datetime
+        try:
+            task_id = int(parts[2])
+        except ValueError:
+            await callback.answer("Ошибка! Некорректный ID задачи.", show_alert=True)
+            return
+
+        await state.update_data(task_id=task_id)
+
+        if action == "text":
+            await callback.message.answer("✍️ Введи новый текст задачи:")
+            await state.set_state(EditTaskFSM.waiting_text)
+        elif action == "datetime":
+            await callback.message.answer("📅 Введи дату и время задачи в формате ДД.ММ.ГГГГ")
+            await state.set_state(EditTaskFSM.waiting_date)
+
+        await callback.answer()
+        return
+    # Создаём календарь на выбранный месяц
+def get_calendar(year: int, month: int) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=7)
+
+    # Заголовок с навигацией
+    prev_month = (datetime(year, month, 1) - timedelta(days=1))
+    next_month = (datetime(year, month, 28) + timedelta(days=4))  # точно переходит на следующий месяц
+    markup.row(
+        InlineKeyboardButton("⬅️", callback_data=f"change_month_{prev_month.year}_{prev_month.month}"),
+        InlineKeyboardButton(f"{month}.{year}", callback_data="ignore"),
+        InlineKeyboardButton("➡️", callback_data=f"change_month_{next_month.year}_{next_month.month}")
+    )
+
+    # Дни недели
+    markup.row(*[InlineKeyboardButton(d, callback_data="ignore") for d in "Пн Вт Ср Чт Пт Сб Вс".split()])
+
+    # Кнопки дней
+    first_weekday, days_in_month = calendar.monthrange(year, month)
+    buttons = []
+
+    # Пустые кнопки для сдвига начала месяца
+    for _ in range((first_weekday + 6) % 7):
+        buttons.append(InlineKeyboardButton(" ", callback_data="ignore"))
+
+    for day in range(1, days_in_month + 1):
+        buttons.append(InlineKeyboardButton(str(day), callback_data=f"calendar_{year}_{month}_{day}"))
+
+    markup.add(*buttons)
+    return markup
+
+
+# Нажатие на "Дату и время"
+@router.callback_query(F.data.startswith("edit_datetime"))
+async def edit_datetime(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get("task_id")
+    now = datetime.now()
+
+    await callback.message.answer(
+        "Выбери новую дату для задачи:",
+        reply_markup=get_calendar(now.year, now.month)
+    )
+    await callback.answer()
+
+
+# Листание месяцев
+@router.callback_query(F.data.startswith("change_month_"))
+async def change_month(callback: CallbackQuery, state: FSMContext):
+    _, year, month = callback.data.split("_")[2:]
+    year, month = int(year), int(month)
+
+    await callback.message.edit_reply_markup(reply_markup=get_calendar(year, month))
+    await callback.answer()
+
+
+# Выбор конкретного дня
+@router.callback_query(F.data.startswith("calendar_"))
+async def calendar_handler(callback: CallbackQuery, state: FSMContext):
+    _, year, month, day = callback.data.split("_")
+    new_date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"  # YYYY-MM-DD
+    await state.update_data(date=new_date)
+
+    await callback.message.answer(
+        f"Выбрана дата: {day}.{month}.{year}\nТеперь введи время в формате ЧЧ:ММ"
+    )
+    await state.set_state(EditDateFSM.waiting_time)
+    await callback.answer()
+
+
+
+# Сохраняем новый текст
+@router.message(EditTaskFSM.waiting_text)
+async def save_new_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data["task_id"]
+    new_text = message.text
+
+    await db.execute(
+        "UPDATE tasks SET text=$1 WHERE id=$2",
+        new_text,
+        task_id
+    )
+
+    await message.answer(f"✅ Текст задачи обновлён:\n{new_text}")
+    await state.clear()
+
+# Сохраняем новую дату
+@router.message(EditTaskFSM.waiting_date)
+async def save_new_date(message: Message, state: FSMContext):
+    try:
+        day, month, year = map(int, message.text.split("."))
+    except ValueError:
+        await message.answer("❌ Формат даты: ДД.ММ.ГГГГ")
+        return
+
+    new_date = f"{year}-{month:02d}-{day:02d}"
+    await state.update_data(date=new_date)
+
+    await message.answer("⏰ Введи время задачи в формате ЧЧ:ММ")
+    await state.set_state(EditTaskFSM.waiting_time)
+
+# Сохраняем новое время и обновляем дату и время
+@router.message(EditTaskFSM.waiting_time)
+async def save_new_datetime(message: Message, state: FSMContext):
+    try:
+        hour, minute = map(int, message.text.split(":"))
+    except ValueError:
+        await message.answer("❌ Формат времени: ЧЧ:ММ")
+        return
+
+    data = await state.get_data()
+    task_id = data["task_id"]
+    new_dt_str = f"{data['date']} {hour:02d}:{minute:02d}"
+    
+    from datetime import datetime
+    new_dt = datetime.strptime(new_dt_str, "%Y-%m-%d %H:%M")
+
+    await db.execute(
+        "UPDATE tasks SET task_datetime=$1 WHERE id=$2",
+        new_dt,
+        task_id
+    )
+
+    # Перепланируем отложенную отправку (если используется)
+    scheduler.add_job(
+        bot.send_message,
+        "date",
+        run_date=new_dt,
+        args=[GROUP_ID, f"⏰ <b>Обновлённая задача</b>"],
+        id=f"delayed_{task_id}",
+        replace_existing=True
+    )
+
+
+
+    task = await db.fetchrow(
+    "SELECT text, task_datetime FROM tasks WHERE id=$1",
+    task_id
+)
+    text = (
+    "📌 Задача:\n"
+    f"{task['text']}\n\n"
+    f"⏰ {task['task_datetime'].strftime('%d.%m.%Y %H:%M')}"
+)
+    await bot.send_message(
+    GROUP_ID,
+    text
+)
+
+
+    await message.answer(f"✅ Дата и время обновлены:\n{new_dt.strftime('%d.%m.%Y %H:%M')}")
+    await state.clear()
+
+@router.callback_query(F.data.startswith("edit_text"), F.data.startswith("edit_datetime"))
+async def save_task_changes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get("task_id")
+    task_text = data.get("task_text")  # обновлённый текст
+    task_datetime = data.get("task_datetime")  # обновлённая дата/время
+
+    # Обновляем в базе
+    await db.execute(
+        "UPDATE tasks SET text=$1, datetime=$2 WHERE id=$3",
+        task_text, task_datetime, task_id
+    )
+
+    # Формируем текст для группы
+    new_message_text = (
+        f"Задача обновлена!\n\n"
+        f"Текст: {task_text}\n"
+        f"Дата и время: {task_datetime.strftime('%d.%m.%Y %H:%M')}"
+    )
+
+    # Отправляем в группу (или редактируем существующее сообщение)
+    group_chat_id = GROUP_ID 
+    root_message_id = data.get("root_message_id")  # если храните ID первого сообщения
+    if root_message_id:
+        await bot.edit_message_text(
+            chat_id=group_chat_id,
+            message_id=root_message_id,
+            text=new_message_text
+        )
+    else:
+        msg = await bot.send_message(chat_id=group_chat_id, text=new_message_text)
+        # Сохраняем message_id для последующих обновлений
+        await db.execute("UPDATE tasks SET root_message_id=$1 WHERE id=$2", msg.message_id, task_id)
+
+    await callback.answer("Задача обновлена!")
+
+
+@router.callback_query(F.data.startswith("del_"))
+async def delete_task(callback: CallbackQuery):
+    task_id = int(callback.data.split("_")[1])
+
+    await db.execute("DELETE FROM tasks WHERE id=$1", task_id)
+
+    try:
+        scheduler.remove_job(f"task_{task_id}")
+    except:
+        pass
+
+    await callback.message.answer("🗑 Задача удалена")
+    await callback.answer()
+
+@router.callback_query(F.data == "all_tasks")
+async def all_tasks(callback: CallbackQuery):
+    rows = await db.fetch(
+        """
+        SELECT * FROM tasks
+        WHERE user_id=$1
+        ORDER BY task_datetime
+        """,
+        callback.from_user.id
+    )
+
+    if not rows:
+        await callback.message.answer("Нет задач.")
+        return
+
+    current_month = None
+    for task in rows:
+        month = task["task_datetime"].strftime("%B %Y") if task["task_datetime"] else "Без даты"
+        if month != current_month:
+            current_month = month
+            await callback.message.answer(f"📅 <b>{month}</b>")
+
+        await callback.message.answer(
+            f"• {task['text']} ({task['task_datetime'].strftime('%d.%m %H:%M') if task['task_datetime'] else ''})"
+        )
+
+    await callback.answer()
+    
+
+@router.message(Command("edit"))
+async def edit_cmd(message: Message):
+    await message.answer("✏️ Используй кнопки редактирования в списке задач.")
+
+
+@router.message(Command("delete"))
+async def delete_cmd(message: Message):
+    await message.answer("🗑 Используй кнопки удаления в списке задач.")
+
+ADMIN_ID = 335256810
+
+@router.message(F.text == "/архив")
+async def archive_tasks(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("❌ У тебя нет доступа к архиву")
+        return
+
+    tasks = await db.fetch(
+        "SELECT id, text, user_id, completed_at FROM tasks WHERE completed=TRUE ORDER BY completed_at DESC"
+)
+
+    archive_text = ""
+    for t in tasks:
+        dt = t['completed_at'].strftime("%d.%m.%Y %H:%M") if t['completed_at'] else "неизвестно"
+        archive_text += f"✅ Задача: {t['text']}\nПользователь: {t['user_id']}\nВыполнена: {dt}\n\n"
+
+    await message.answer(archive_text or "Архив пуст.")
+
+async def task_scheduler():
+    while True:
+        now = datetime.now()
+        # Получаем задачи, которые нужно отправить
+        tasks = await db.fetch("SELECT id, text, user_id FROM tasks WHERE completed=FALSE AND next_send <= $1", now)
+        for task in tasks:
+            msg = await bot.send_message(chat_id=GROUP_ID, text=f"Задача: {task['text']}")
+            # Обновляем время следующей отправки
+            next_send = now + timedelta(hours=1)
+            await db.execute("UPDATE tasks SET next_send=$1 WHERE id=$2", next_send, task['id'])
+        await asyncio.sleep(60)  # проверяем каждые 60 секунд
+
+async def task_scheduler():
+    while True:
+        now = datetime.now()
+
+        tasks = await db.fetch(
+            """
+            SELECT id, text, chat_id
+            FROM tasks
+            WHERE completed = FALSE
+              AND next_send_at <= $1
+            """,
+            now
+        )
+
+        for task in tasks:
+            msg = await bot.send_message(
+                task["chat_id"],
+                f"📌 ЗАДАЧА:\n{task['text']}"
+            )
+
+            # сохраняем message_id для + / принято
+            await db.execute(
+                """
+                INSERT INTO task_messages (task_id, chat_id, message_id)
+                VALUES ($1, $2, $3)
+                """,
+                task["id"], task["chat_id"], msg.message_id
+            )
+
+            # переносим следующее напоминание
+            await db.execute(
+                """
+                UPDATE tasks
+                SET next_send_at = $1
+                WHERE id = $2
+                """,
+                now + timedelta(hours=1),
+                task["id"]
+            )
+
+        await asyncio.sleep(60)  # проверяем раз в минуту
+
+@router.message(F.text.in_(["+", "принято"]))
+async def group_task_action(message: Message):
+    if not message.reply_to_message:
+        return
+
+    task = await db.fetchrow(
+        """
+        SELECT * FROM tasks
+        WHERE root_message_id <= $1
+          AND last_message_id >= $1
+          AND completed = FALSE
+        """,
+        message.reply_to_message.message_id
+    )
+
+    if not task:
+        return
+
+    if message.text == "+":
+        await complete_task(task["id"])
+        await message.reply("✅ Задача выполнена")
+
+    elif message.text == "принято":
+        await db.execute(
+            "UPDATE tasks SET assigned_user_id = $1 WHERE id = $2",
+            message.from_user.id,
+            task["id"]
+        )
+        await message.reply("👤 Ты назначен исполнителем")
+
+@router.message(F.text == "+", F.reply_to_message)
+async def complete_by_plus(message: Message):
+    reply = message.reply_to_message
+
+    task = await db.fetchrow(
+        "SELECT * FROM tasks WHERE task_message_id=$1 AND completed=FALSE",
+        reply.message_id
+    )
+
+    if not task:
+        return
+
+    await db.execute(
+        "UPDATE tasks SET completed=TRUE WHERE id=$1",
+        task["id"]
+    )
+
+    await message.reply("✅ Задача выполнена")
+
+@router.message(
+    F.text.lower().in_(["принято", "принял", "беру"]),
+    F.reply_to_message
+)
+async def accept_task(message: Message):
+    reply = message.reply_to_message
+
+    task = await db.fetchrow(
+        "SELECT * FROM tasks WHERE task_message_id=$1",
+        reply.message_id
+    )
+
+    if not task:
+        return
+
+    await db.execute(
+        """
+        UPDATE tasks
+        SET assigned_user_id=$1,
+            assigned_username=$2
+        WHERE id=$3
+        """,
+        message.from_user.id,
+        message.from_user.full_name,
+        task["id"]
+    )
+
+    await message.reply(
+        f"🧑‍💼 Исполнитель назначен: <b>{message.from_user.full_name}</b>"
+    )
+
+# ===================== START =====================
+
+async def main():
+    await init_db()
+    scheduler.start()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
