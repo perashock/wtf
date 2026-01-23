@@ -27,9 +27,28 @@ from aiogram.types import (
 
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 # ===================== CONFIG =====================
 
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+GROUP_ID = int(os.getenv("GROUP_ID"))
 
+ALLOWED_ASSIGNEES = set(
+    x.strip()
+    for x in os.getenv("ALLOWED_ASSIGNEES", "").split(",")
+    if x
+)
+
+ALLOWED_USERS = set(
+    x.strip()
+    for x in os.getenv("ALLOWED_USERS", "").split(",")
+    if x
+)
+router = Router()
+
+BOT_PASSWORD = os.getenv("BOT_PASSWORD")
+
+POSTGRES_DSN = os.getenv("POSTGRES_DSN")
 
 
 class AddTaskFSM(StatesGroup):
