@@ -27,6 +27,8 @@ from aiogram.types import (
 
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
+import os
 
 # ===================== CONFIG =====================
 
