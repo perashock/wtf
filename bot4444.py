@@ -33,6 +33,7 @@ load_dotenv()
 
 # ===================== CONFIG =====================
 
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 
@@ -62,7 +63,6 @@ router = Router()
 BOT_PASSWORD = os.getenv("BOT_PASSWORD")
 
 POSTGRES_DSN = os.getenv("POSTGRES_DSN")
-
 
 class AddTaskFSM(StatesGroup):
     waiting_text = State()
@@ -388,7 +388,7 @@ async def get_time(message: Message, state: FSMContext):
         "%Y-%m-%d %H:%M"
     )
 
-row = await db.fetchrow(
+    row = await db.fetchrow(
         """
         INSERT INTO tasks (user_id, text, task_datetime, created_at)
         VALUES ($1, $2, $3, $4)
@@ -400,8 +400,8 @@ row = await db.fetchrow(
         datetime.now()      # TIMESTAMP ✅
     )
 
-    async def get_employees():
-        async with db.acquire() as conn:
+async def get_employees():
+    async with db.acquire() as conn:
             return await conn.fetch("""
             SELECT id, full_name, room
             FROM employees
@@ -651,7 +651,7 @@ async def handle_task_reply(message: Message):
             task["id"]
         )
 
-# Сообщение в группе
+        # Сообщение в группе
         await message.answer(
             f"✅ <b>Исполнитель назначен: @{tag}</b>",
             parse_mode="HTML"
@@ -768,6 +768,7 @@ def format_task_text(task: dict):
 
     return f"📌 <b>{task['text']}</b>{executor_text}\n⏰ {dt_text}"
 
+
 # ===================== ОБЩАЯ ФУНКЦИЯ СОЗДАНИЯ КНОПОК =====================
 def task_buttons(task: dict):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -880,7 +881,7 @@ async def done_callback(callback: CallbackQuery):
 
     await complete_task(task_id)
 
-await callback.message.answer("✅ Задача выполнена")
+    await callback.message.answer("✅ Задача выполнена")
     await callback.answer()
 
 
@@ -1027,7 +1028,7 @@ async def save_new_datetime(message: Message, state: FSMContext, db, bot: Bot):
     # Собираем datetime
     new_dt = datetime.strptime(f"{data['date']} {hour}:{minute}", "%Y-%m-%d %H:%M")
 
-# Обновляем базу
+    # Обновляем базу
     await db.execute(
         "UPDATE tasks SET task_datetime=$1 WHERE id=$2",
         new_dt,
@@ -1155,7 +1156,7 @@ async def edit_task(callback: CallbackQuery, state: FSMContext):
 def get_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=7)
 
-# Заголовок с навигацией
+    # Заголовок с навигацией
     prev_month = (datetime(year, month, 1) - timedelta(days=1))
     next_month = (datetime(year, month, 28) + timedelta(days=4))  # точно переходит на следующий месяц
     markup.row(
@@ -1274,7 +1275,7 @@ async def save_new_datetime(message: Message, state: FSMContext):
         task_id
     )
 
-# Перепланируем отложенную отправку (если используется)
+    # Перепланируем отложенную отправку (если используется)
     scheduler.add_job(
         bot.send_message,
         "date",
@@ -1417,7 +1418,7 @@ async def archive_tasks(message: Message):
         "SELECT id, text, user_id, completed_at FROM tasks WHERE completed=TRUE ORDER BY completed_at DESC"
 )
 
-archive_text = ""
+    archive_text = ""
     for t in tasks:
         dt = t['completed_at'].strftime("%d.%m.%Y %H:%M") if t['completed_at'] else "неизвестно"
         archive_text += f"✅ Задача: {t['text']}\nПользователь: {t['user_id']}\nВыполнена: {dt}\n\n"
@@ -1542,7 +1543,7 @@ async def create_task_from_allowed_groups(message: Message):
         parse_mode="HTML"
     )
 
-# сохраняем message_id
+    # сохраняем message_id
     await db.execute(
         "UPDATE tasks SET task_message_id=$1 WHERE id=$2",
         msg.message_id,
@@ -1697,7 +1698,7 @@ async def handle_task_accept_or_done(message: Message):
         if task["assigned_user_id"]:
             return
 
-await db.execute(
+        await db.execute(
             """
             UPDATE tasks
             SET assigned_user_id = $1
@@ -1735,5 +1736,5 @@ async def main():
     asyncio.create_task(task_scheduler())
     await dp.start_polling(bot)
 
-if name == "main":
+if __name__ == "__main__":
     asyncio.run(main())
