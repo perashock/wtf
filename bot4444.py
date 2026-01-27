@@ -238,7 +238,7 @@ async def get_text(message: Message, state: FSMContext):
     await state.set_state(AddTaskFSM.waiting_date)
     await message.answer(
         "📅 Выбери дату:",
-        reply_markup=calendar_kb(now.year, now.month)  # красочный календарь
+        reply_markup=calendar_kb(now.year, now.month) 
     )
 
 @router.callback_query(lambda c: c.data.startswith("cal_"))
@@ -308,9 +308,9 @@ async def get_time(message: Message, state: FSMContext):
 async def calendar_handler(callback: CallbackQuery, state: FSMContext):
     data = callback.data.split("_")
 
-    # -------------------------------
+
     # 1. Выбор конкретного дня
-    # -------------------------------
+
     if data[1] == "day":
         # безопасная распаковка
         if len(data) < 5:
@@ -334,9 +334,9 @@ async def calendar_handler(callback: CallbackQuery, state: FSMContext):
         else:
             await callback.answer("Неверное состояние FSM!")
 
-    # -------------------------------
+
     # 2. Переход на предыдущий месяц
-    # -------------------------------
+
     elif data[1] == "prev":
         if len(data) < 4:
             await callback.answer("Ошибка календаря!")
@@ -349,9 +349,8 @@ async def calendar_handler(callback: CallbackQuery, state: FSMContext):
             year -= 1
         await callback.message.edit_reply_markup(reply_markup=calendar_kb(year, month))
 
-    # -------------------------------
     # 3. Переход на следующий месяц
-    # -------------------------------
+
     elif data[1] == "next":
         if len(data) < 4:
             await callback.answer("Ошибка календаря!")
@@ -364,9 +363,9 @@ async def calendar_handler(callback: CallbackQuery, state: FSMContext):
             year += 1
         await callback.message.edit_reply_markup(reply_markup=calendar_kb(year, month))
 
-    # -------------------------------
+
     # 4. Подтверждение выбора
-    # -------------------------------
+
     await callback.answer()
 
 
@@ -435,7 +434,7 @@ async def get_employees():
 
     await state.clear()
 # ===================== CAB =====================
-# -------------------- ОТКРЫТИЕ КАБИНЕТОВ --------------------
+
 @router.callback_query(F.data == "cabinet")
 async def open_cabinets(callback: CallbackQuery):
     employees = await db.fetch(
@@ -544,7 +543,7 @@ async def send_cabinets_main(callback: CallbackQuery):
     for chat_id in CABINET_GROUP_IDS:
         msg = await bot.send_message(chat_id, text)
     
-    # закрепляем только если это реально группа (не приватный чат)
+   
     try:
         await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
     except Exception as e:
@@ -671,7 +670,7 @@ from aiogram import F
 from datetime import datetime
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
-@router.message(F.text == "/my_tasks")  # Пример вызова списка задач в ЛС
+@router.message(F.text == "/my_tasks") 
 async def show_my_tasks(message: Message):
     user_id = message.from_user.id
     tasks = await db.fetch("SELECT id, text, task_datetime FROM tasks WHERE user_id=$1 AND completed=FALSE ORDER BY task_datetime", user_id)
@@ -1110,10 +1109,9 @@ async def set_executor(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("edit_"))
 async def edit_task(callback: CallbackQuery, state: FSMContext):
-    # callback.data раньше был вида "edit_123"
+    
     parts = callback.data.split("_")
 
-    # Проверка: если у нас старый формат "edit_123"
     if len(parts) == 2:
         try:
             task_id = int(parts[1])
@@ -1275,7 +1273,7 @@ async def save_new_datetime(message: Message, state: FSMContext):
         task_id
     )
 
-    # Перепланируем отложенную отправку (если используется)
+    # Перепланируем отложенную отправку
     scheduler.add_job(
         bot.send_message,
         "date",
@@ -1339,7 +1337,7 @@ async def save_task_changes(callback: CallbackQuery, state: FSMContext):
 
     # Отправляем в группу (или редактируем существующее сообщение)
     group_chat_id = GROUP_ID 
-    root_message_id = data.get("root_message_id")  # если храните ID первого сообщения
+    root_message_id = data.get("root_message_id")  
     if root_message_id:
         await bot.edit_message_text(
             chat_id=group_chat_id,
@@ -1528,7 +1526,7 @@ async def task_scheduler():
             import traceback
             print(traceback.format_exc())
             await asyncio.sleep(10)
-            
+
         # Ждём 30 секунд перед следующей итерацией
         await asyncio.sleep(30)
 
