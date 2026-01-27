@@ -33,30 +33,35 @@ load_dotenv()
 
 # ===================== CONFIG =====================
 
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 
-ALLOWED_ASSIGNEES = set(
-    x.strip()
-    for x in os.getenv("ALLOWED_ASSIGNEES", "").split(",")
-    if x
-)
 
-ALLOWED_USERS = set(
-    x.strip()
-    for x in os.getenv("ALLOWED_USERS", "").split(",")
-    if x
-)
+def parse_dict(value: str) -> dict:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        print("ENV PARSE ERROR:", e, value)
+        return {}
 
-# Группы, где РАЗРЕШЕНО писать /задача
-ALLOWED_TASK_GROUPS = int(os.getenv("ALLOWED_TASK_GROUPS"))
+ALLOWED_ASSIGNEES = parse_dict(os.getenv("ALLOWED_ASSIGNEES"))
+ALLOWED_USERS = parse_dict(os.getenv("ALLOWED_USERS"))
 
-# Корневая группа (куда падают все задачи)
-ROOT_GROUP_ID = int(os.getenv("ROOT_GROUP_ID"))
+CABINET_GROUP_IDS = [
+    int(x.strip())
+    for x in os.getenv("CABINET_GROUP_IDS", "").split(",")
+    if x.strip()
+]
 
-# Кабинеты — куда слать сообщения
-CABINET_GROUP_IDS = int(os.getenv("CABINET_GROUP_IDS"))
+ALLOWED_TASK_GROUPS = [
+    int(x.strip())
+    for x in os.getenv("ALLOWED_TASK_GROUPS", "").split(",")
+    if x.strip()
+]
+
+ROOT_GROUP_ID = int(os.getenv("ROOT_GROUP_ID", 0))
 
 router = Router()
 
