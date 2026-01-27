@@ -1432,79 +1432,107 @@ async def send_message_safe(chat_id: int, text: str):
         parse_mode=ParseMode.HTML
     )
 
-    from datetime import datetime, timedelta
-import asyncio
+    import asyncio
+from datetime import datetime, timedelta
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# Глобальная переменная, чтобы не запускать scheduler дважды
+scheduler_started = False
 
 async def task_scheduler():
+    global scheduler_started
+    if scheduler_started:
+        return
+    scheduler_started = True
+
     while True:
         try:
             now = datetime.now()
 
-            # Получаем все задачи, у которых пора отправлять напоминание
             tasks = await db.fetch(
                 """
                 SELECT *
                 FROM tasks
                 WHERE completed = FALSE
-                  AND (next_send_at IS NULL OR next_send_at <= $1)
-                ORDER BY task_datetime ASC NULLS LAST
+                  AND next_send_at <= $1
+                ORDER BY next_send_at ASC
                 """,
                 now
             )
 
             for task in tasks:
-                # Формируем дату и время
-                dt_text = task["task_datetime"].strftime("%d.%m.%Y %H:%M") if task["task_datetime"] else "Без даты"
+                task_datetime = task["task_datetime"]      # может быть None
+                next_send = task["next_send_at"]           # всегда есть
 
-                # Исполнитель
+                # 1️⃣ Если у задачи есть дата, но она ещё не наступила — ждём
+                if task_datetime and next_send < task_datetime:
+                    continue
+
+                send_time = next_send
+
+                # ---- ТЕКСТ ----
+                dt_text = (
+                    task_datetime.strftime("%d.%m.%Y %H:%M")
+                    if task_datetime else "Без даты"
+                )
+
                 executor_text = ""
                 if task.get("assigned_user_id"):
-                    assigned_nick = next((nick for nick, uid in ALLOWED_ASSIGNEES.items() if uid == task["assigned_user_id"]), None)
+                    assigned_nick = next(
+                        (nick for nick, uid in ALLOWED_ASSIGNEES.items()
+                         if uid == task["assigned_user_id"]),
+                        None
+                    )
                     if assigned_nick:
                         executor_text = f"\n👤 Исполнитель: @{assigned_nick}"
 
-                # Основной текст напоминания
-                text = f"⏰ <b>Напоминание о задаче</b>:\n📌 {task['text']}{executor_text}\n🗓 {dt_text}"
-
-                # Кнопка Выполнить
                 keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="✅ Выполнить",
-                                callback_data=f"done_{task['id']}"
-                            )
-                        ]
-                    ]
+                    inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="✅ Выполнить",
+                            callback_data=f"done_{task['id']}"
+                        )
+                    ]]
                 )
 
-                # Отправляем в группу
-                msg = await bot.send_message(
-                    chat_id=GROUP_ID,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode="HTML"
-                )
+                sent_any = False
 
-                # Обновляем next_send_at
-                prev_next = task["next_send_at"] or now
-                next_send = prev_next + timedelta(hours=1)
-                await db.execute(
-                    "UPDATE tasks SET next_send_at=$1 WHERE id=$2",
-                    next_send,
-                    task['id']
-                )
+                # 2️⃣ Catch-up — шлём ВСЕ пропущенные часы
+                while send_time <= now:
+                    text = (
+                        f"⏰ <b>Напоминание о задаче</b>\n"
+                        f"📌 {task['text']}{executor_text}\n"
+                        f"🗓 {dt_text}\n"
+                        f"⏱ Запланировано: {send_time.strftime('%H:%M')}"
+                    )
 
-            # Проверка каждую минуту
-            await asyncio.sleep(60)
+                    await bot.send_message(
+                        chat_id=GROUP_ID,
+                        text=text,
+                        reply_markup=keyboard,
+                        parse_mode="HTML"
+                    )
+
+                    send_time += timedelta(hours=1)
+                    sent_any = True
+
+                # 3️⃣ Сохраняем СТРОГО будущее время
+                if sent_any:
+                    await db.execute(
+                        "UPDATE tasks SET next_send_at=$1 WHERE id=$2",
+                        send_time,
+                        task["id"]
+                    )
 
         except Exception:
-            # Лог ошибок, чтобы scheduler не падал
             import traceback
             print(traceback.format_exc())
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
+            
+        # Ждём 30 секунд перед следующей итерацией
+        await asyncio.sleep(30)
 
-
+    
         
 
 @router.message(Command("задача"))
