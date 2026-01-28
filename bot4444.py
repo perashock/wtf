@@ -28,7 +28,7 @@ from aiogram.types import (
 import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-
+import json
 load_dotenv()
 
 # ===================== CONFIG =====================
@@ -830,7 +830,6 @@ async def tomorrow_tasks(callback: CallbackQuery):
     end_of_day = tomorrow.replace(hour=23, minute=59, second=59, microsecond=999999)
     await send_tasks_for_day(callback, start_of_day, end_of_day, "завтра")
 
-
 @router.callback_query(F.data == "all_tasks")
 async def all_tasks(callback: CallbackQuery):
     rows = await db.fetch("SELECT * FROM tasks WHERE completed=FALSE ORDER BY task_datetime")
@@ -1466,19 +1465,14 @@ async def task_scheduler():
             for task in tasks:
                 task_datetime = task["task_datetime"]      # может быть None
                 next_send = task["next_send_at"]           # всегда есть
+                created_at = task["created_at"]
 
-                # 1️⃣ Если у задачи есть дата, но она ещё не наступила — ждём
-                if task_datetime and next_send < task_datetime:
-                    continue
-
-                send_time = next_send
-
-                # ---- ТЕКСТ ----
+                # Формируем текст даты
                 dt_text = (
-                    task_datetime.strftime("%d.%m.%Y %H:%M")
-                    if task_datetime else "Без даты"
+                    task_datetime.strftime("%d.%m.%Y %H:%M") if task_datetime else "Без даты"
                 )
 
+                # Исполнитель
                 executor_text = ""
                 if task.get("assigned_user_id"):
                     assigned_nick = next(
@@ -1498,15 +1492,13 @@ async def task_scheduler():
                     ]]
                 )
 
-                sent_any = False
-
-                # 2️⃣ Catch-up — шлём ВСЕ пропущенные часы
-                while send_time <= now:
+                # ---- Отправка задачи один раз ----
+                if next_send <= now:
                     text = (
                         f"⏰ <b>Напоминание о задаче</b>\n"
                         f"📌 {task['text']}{executor_text}\n"
                         f"🗓 {dt_text}\n"
-                        f"⏱ Запланировано: {send_time.strftime('%H:%M')}"
+                        #f"⏱ Запланировано: {next_send.strftime('%H:%M')}"
                     )
 
                     await bot.send_message(
@@ -1516,14 +1508,15 @@ async def task_scheduler():
                         parse_mode="HTML"
                     )
 
-                    send_time += timedelta(hours=1)
-                    sent_any = True
+                    # ---- Новый расчет next_send_at ----
+                    if task.get("chat_type") == "private":  # ЛС
+                        new_next_send = task_datetime + timedelta(hours=3)
+                    else:  # группа
+                        new_next_send = now + timedelta(hours=3)
 
-                # 3️⃣ Сохраняем СТРОГО будущее время
-                if sent_any:
                     await db.execute(
                         "UPDATE tasks SET next_send_at=$1 WHERE id=$2",
-                        send_time,
+                        new_next_send,
                         task["id"]
                     )
 
@@ -1758,6 +1751,70 @@ async def handle_task_accept_or_done(message: Message):
             )
         except:
             pass
+
+
+import psycopg2
+import psycopg2.pool
+
+# -----------------------------
+# 1️⃣ Создаём пул один раз
+# -----------------------------
+db_pool = psycopg2.pool.SimpleConnectionPool(
+    1, 10,  # минимальное и максимальное количество соединений
+    POSTGRES_DSN
+)
+
+# -----------------------------
+# 2️⃣ Патчим psycopg2.connect
+# -----------------------------
+original_connect = psycopg2.connect  # на всякий случай
+
+def pooled_connect(*args, **kwargs):
+    """
+    Возвращает соединение из пула, вместо нового подключения.
+    """
+    conn = db_pool.getconn()
+
+    # Оборачиваем close, чтобы возвращать соединение в пул вместо закрытия
+    def close_override():
+        db_pool.putconn(conn)
+    conn.close = close_override
+
+    return conn
+
+psycopg2.connect = pooled_connect
+
+# -----------------------------
+# 3️⃣ Универсальная функция для запросов
+# -----------------------------
+def query_db(sql, params=None):
+    # Если params не кортеж или список — превращаем в кортеж
+    if params is not None and not isinstance(params, (tuple, list)):
+        params = (params,)
+
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            # Автоматически возвращаем результат для SELECT
+            if sql.strip().lower().startswith("select"):
+                return cur.fetchall()
+            else:
+                conn.commit()
+    finally:
+        db_pool.putconn(conn)
+
+# -----------------------------
+# 4️⃣ Примеры использования
+# -----------------------------
+# SELECT
+users = query_db("SELECT * FROM users WHERE active=%s", True)
+print(users)
+
+# UPDATE (одиночный параметр работает без запятой)
+user_id = 42
+query_db("UPDATE users SET last_seen=NOW() WHERE id=%s", user_id)
+
 
 # ===================== START =====================
 
